@@ -54,6 +54,12 @@ with `fetch-depth: 0` first so the base branch can be resolved:
       ^internal/starrocks/mysqldriver/
 ```
 
+## CI onboarding
+
+New Kubeflow subprojects can use the [CI onboarding checklist](docs/ci-onboarding.md) to choose
+runner trust boundaries, add the shared source checks, select an end-to-end cluster strategy, and
+verify the first pull request from a fork.
+
 ## Contributing
 
 We welcome contributions to enhance support for common Kubeflow infrastructure! Please see our
