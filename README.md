@@ -35,6 +35,45 @@ python hack/boilerplate/boilerplate.py --base-ref main \
 
 The following GitHub actions are available.
 
+### PR admission gate
+
+Gates pull requests from external contributors on a maintainer-triaged issue. Kubeflow organization
+members bypass the issue check. Other authors must reference an issue in the calling repository with
+`Fixes #123` at the start of its own line, and that issue must have the configured admission label.
+Admitted pull requests receive `ok-to-test`; `needs-ok-to-test` is removed and pending fork workflow
+runs for the current head are approved. Pull requests that do not meet the policy receive an
+explanation and are closed.
+
+Create a caller such as `.github/workflows/pr-admission.yml`. Pin the reusable workflow to a full
+commit SHA, and create the `ok-to-test`, `needs-ok-to-test`, and admission labels in the calling
+repository before enabling it:
+
+```yaml
+name: PR Admission
+
+on:
+  pull_request_target:
+    types: [opened, labeled, synchronize, reopened]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  issues: read
+
+jobs:
+  admission:
+    uses: kubeflow/testing/.github/workflows/pr-admission-gate.yml@<commit-sha>
+    with:
+      admission_label: ready
+      exempt_bots: '["dependabot[bot]", "copybara-service[bot]"]'
+```
+
+The gate checks out only its helper scripts from the pinned `kubeflow/testing` commit. It never
+checks out or executes code from the pull request. The caller cannot grant the reusable workflow
+more permissions than those declared above. An invalid bot JSON value, unavailable membership data,
+or ambiguous pull-request head fails closed without approving workflow runs.
+
 ### verify-boilerplate
 
 Runs the license header check above against the calling repository. Check out the repository

@@ -1,0 +1,245 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Reusable PR Admission Gate
+
+on:
+  workflow_call:
+    inputs:
+      admission_label:
+        description: Label a maintainer must apply to the linked issue.
+        required: false
+        type: string
+        default: ready
+      exempt_bots:
+        description: JSON array of bot logins that bypass the gate.
+        required: false
+        type: string
+        default: '["dependabot[bot]", "copybara-service[bot]"]'
+      closure_message:
+        description: Optional message used when the admission check fails.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  issues: read
+
+jobs:
+  check-pr-author:
+    if: >-
+      ${{ !contains(fromJSON(inputs.exempt_bots),
+                    github.event.pull_request.user.login) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout trusted admission helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .pr-admission-workflow
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/pr_admission/kubeflow_membership.py
+            .github/scripts/pr_admission/issue_reference.py
+            .github/scripts/pr_admission/requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+
+      - name: Install workflow dependencies
+        run: >-
+          python3 -m pip install -r
+          .pr-admission-workflow/.github/scripts/pr_admission/requirements.txt
+
+      - name: Look up PR author in Kubeflow internal-acls
+        id: membership-check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: >-
+          python3
+          .pr-admission-workflow/.github/scripts/pr_admission/kubeflow_membership.py
+
+      - name: Check linked issue admission for external contributors
+        id: admission
+        if: steps.membership-check.outputs.is_member == 'false'
+        env:
+          ADMISSION_LABEL: ${{ inputs.admission_label }}
+          CLOSURE_MESSAGE: ${{ inputs.closure_message }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          close_for_admission() {
+            local detail="$1"
+            local message="${CLOSURE_MESSAGE}"
+            if [[ -z "${message}" ]]; then
+              message=$(cat <<EOF
+          Pull requests from external contributors must reference an issue in this
+          repository that a maintainer has labeled \`${ADMISSION_LABEL}\`.
+
+          ${detail}
+
+          After the issue is triaged, add \`Fixes #123\` on its own line in the
+          pull request description and reopen the pull request.
+          EOF
+              )
+            fi
+            gh pr comment "${PR_NUMBER}" --repo "${GH_REPO}" --body "${message}"
+            gh pr close "${PR_NUMBER}" --repo "${GH_REPO}"
+          }
+
+          pr_json=$(gh pr view "${PR_NUMBER}" --repo "${GH_REPO}" \
+            --json closingIssuesReferences,baseRefName,body)
+          issue_number=$(printf '%s' "${pr_json}" | python3 \
+            .pr-admission-workflow/.github/scripts/pr_admission/issue_reference.py)
+
+          if [[ -z "${issue_number}" ]]; then
+            detail="No same-repository closing reference was found on its own line."
+            echo "::error::${detail}"
+            close_for_admission "${detail}"
+            exit 1
+          fi
+
+          if ! issue_json=$(gh api "repos/${GH_REPO}/issues/${issue_number}"); then
+            detail="Issue #${issue_number} could not be read from ${GH_REPO}."
+            echo "::error::${detail}"
+            close_for_admission "${detail}"
+            exit 1
+          fi
+          issue_ready=$(printf '%s' "${issue_json}" | jq -r \
+            --arg label "${ADMISSION_LABEL}" \
+            '(has("pull_request") | not) and any(.labels[]; .name == $label)')
+
+          if [[ "${issue_ready}" != "true" ]]; then
+            detail="Issue #${issue_number} does not have the \`${ADMISSION_LABEL}\` label."
+            echo "::error::${detail}"
+            close_for_admission "${detail}"
+            exit 1
+          fi
+
+          echo "::notice::Issue #${issue_number} is admitted. Adding ok-to-test."
+          gh pr edit "${PR_NUMBER}" --repo "${GH_REPO}" \
+            --add-label "ok-to-test"
+
+          pr_labels=$(gh pr view "${PR_NUMBER}" --repo "${GH_REPO}" \
+            --json labels)
+          needs_ok_to_test=$(printf '%s' "${pr_labels}" | jq -r \
+            'any(.labels[]; .name == "needs-ok-to-test")')
+          if [[ "${needs_ok_to_test}" == "true" ]]; then
+            gh pr edit "${PR_NUMBER}" --repo "${GH_REPO}" \
+              --remove-label "needs-ok-to-test"
+          fi
+
+      - name: Approve pending workflow runs after admission
+        if: steps.admission.outcome == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          retries: 3
+          script: |
+            const {owner, repo} = context.repo;
+            const {number, head} = context.payload.pull_request;
+            const headSha = head.sha;
+            const headRepoId = head.repo.id;
+            const headBranch = head.ref;
+            const headOwner = head.repo.owner.login;
+            const listRequest = {
+              owner, repo, event: 'pull_request', status: 'action_required',
+              head_sha: headSha,
+            };
+            const matchesHead = run =>
+              run.event === 'pull_request' &&
+              run.head_sha === headSha &&
+              run.head_repository?.id === headRepoId &&
+              run.head_branch === headBranch &&
+              (!run.pull_requests?.length ||
+                run.pull_requests.some(pr => pr.number === number));
+            const approvedRunIds = new Set();
+            const maxAttempts = 7;
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              const {data: current} = await github.rest.pulls.get({
+                owner, repo, pull_number: number,
+              });
+              if (current.state !== 'open' || current.head.sha !== headSha ||
+                  current.head.repo?.id !== headRepoId ||
+                  current.head.ref !== headBranch) {
+                core.notice('PR head changed or closed; skipping old-head approval.');
+                return;
+              }
+              const labels = new Set(current.labels.map(label => label.name));
+              if (!labels.has('ok-to-test') || labels.has('needs-ok-to-test')) {
+                core.notice('PR approval label changed; skipping workflow approval.');
+                return;
+              }
+
+              // Fork runs can report pull_requests: []; one head must map to
+              // exactly one open PR before any run on it is approved.
+              const headPRs = await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open', head: `${headOwner}:${headBranch}`,
+                per_page: 100,
+              });
+              const matches = headPRs.filter(pr =>
+                pr.head.sha === headSha &&
+                pr.head.repo?.id === headRepoId &&
+                pr.head.ref === headBranch);
+              if (matches.length !== 1 || matches[0].number !== number) {
+                core.setFailed('PR head does not identify exactly one open PR; ' +
+                  'pending workflow runs need manual approval.');
+                return;
+              }
+
+              const runs = (await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo, listRequest
+              )).filter(matchesHead);
+              for (const run of runs) {
+                if (approvedRunIds.has(run.id)) continue;
+                try {
+                  await github.rest.actions.approveWorkflowRun({
+                    owner, repo, run_id: run.id,
+                  });
+                  approvedRunIds.add(run.id);
+                  core.info(`Approved workflow run ${run.id} (${run.name}).`);
+                } catch (error) {
+                  // Another approver may have completed the same run.
+                  core.warning(`Could not approve run ${run.id}: ${error.message}`);
+                }
+              }
+
+              if (attempt < maxAttempts) {
+                await new Promise(resolve => setTimeout(resolve, 10_000));
+              }
+            }
+
+            const unresolved = (await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo, listRequest
+            )).filter(matchesHead);
+            if (unresolved.length) {
+              core.setFailed(`Workflow runs still awaiting approval: ${
+                unresolved.map(run => run.id).join(', ')}`);
+            } else if (!approvedRunIds.size) {
+              core.warning(`No pending workflow runs found for ${headSha}.`);
+            }
